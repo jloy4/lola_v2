@@ -6,13 +6,14 @@ EXTRA_COMPONENTS = \
 	extras/i2c \
 	extras/wificfg \
 	extras/dhcpserver \
+	extras/bearssl \
 	$(abspath ../../components/wolfssl) \
 	$(abspath ../../components/cJSON) \
 	$(abspath ../../components/homekit) \
 
 FLASH_SIZE ?= 32
 
-EXTRA_CFLAGS += -I../.. -DHOMEKIT_SHORT_APPLE_UUIDS
+EXTRA_CFLAGS += -I../.. -DHOMEKIT_SHORT_APPLE_UUIDS -DCONFIG_EPOCH_TIME=$(shell date --utc '+%s')
 
 include $(SDK_PATH)/common.mk
 
