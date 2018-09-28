@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <espressif/esp_wifi.h>
 #include <espressif/esp_sta.h>
+#include <espressif/esp_system.h>
 #include <esp/uart.h>
 #include <esp8266.h>
 #include <FreeRTOS.h>
@@ -8,6 +9,7 @@
 
 #include <unistd.h>
 #include <string.h>
+#include <time.h>
 
 #include "lwip/err.h"
 #include "lwip/sockets.h"
@@ -22,8 +24,18 @@
 
 #include <tsl2561/tsl2561.h>
 #include <wificfg/wificfg.h>
+#include "pwm.h"
 
 #include "bearssl.h"
+
+const int led_gpio = 2;     
+const int potar_gpio = 5;
+uint8_t pwm_pin[1] = {2};
+bool led_on = false;        //oled status
+int led_brightness = 100; //brightness is scaled from 0 to 100 
+
+double lux_back = 0;
+double lux_front = 0;
 
 /* ---------- WIFI HANDLER ------------------ */
 /* ------------------------------------------ */
@@ -58,16 +70,11 @@ void wifi_config() {
 #define CLOCK_SECONDS_PER_HOUR (CLOCK_MINUTES_PER_HOUR*CLOCK_SECONDS_PER_MINUTE)
 #define CLOCK_SECONDS_PER_DAY (CLOCK_HOURS_PER_DAY*CLOCK_SECONDS_PER_HOUR)
 
-#define GET_REQUEST "GET /data.json HTTP/1.1\r\nHost: "WEB_SERVER"\r\nUser-Agent: ESP8266\r\nAccept: */*\r\n\r\n"
+#define GET_REQUEST "GET /data.json HTTP/1.1\r\nHost: "WEB_SERVER"\r\nUser-Agent: ESP8266\r\n\r\n"
 
 char request[300];
 char content[80];
-int count = 0;
 
-
-/*
- * Low-level data read callback for the simplified SSL I/O API.
- */
 static int sock_read(void *ctx, unsigned char *buf, size_t len) {
 	for (;;) {
 		ssize_t rlen;
@@ -83,9 +90,6 @@ static int sock_read(void *ctx, unsigned char *buf, size_t len) {
 	}
 }
 
-/*
- * Low-level data write callback for the simplified SSL I/O API.
- */
 static int sock_write(void *ctx, const unsigned char *buf, size_t len) {
 	for (;;) {
 		ssize_t wlen;
@@ -164,15 +168,11 @@ static br_ssl_client_context sc;
 static br_x509_minimal_context xc;
 static br_sslio_context ioc;
 
-void http_post_task(void *pvParameters) {
+void http_task_helper(void *pvParameters) {
 	int successes = 0, failures = 0;
 	int provisional_time = 0;
 
 	while (1) {
-		/*
-		 * Wait until we can resolve the DNS for the server, as an indication
-		 * our network is probably working...
-		 */
 		const struct addrinfo hints = {
 			.ai_family = AF_INET,
 			.ai_socktype = SOCK_STREAM,
@@ -197,47 +197,27 @@ void http_post_task(void *pvParameters) {
 		printf("Initializing BearSSL... ");
 		br_ssl_client_init_full(&sc, &xc, TAs, TAs_NUM);
 
-		/*
-		 * Set the I/O buffer to the provided array. We allocated a
-		 * buffer large enough for full-duplex behaviour with all
-		 * allowed sizes of SSL records, hence we set the last argument
-		 * to 1 (which means "split the buffer into separate input and
-		 * output areas").
-		 */
 		br_ssl_engine_set_buffer(&sc.eng, bearssl_buffer, sizeof bearssl_buffer, 0);
 
-		/*
-		 * Inject some entropy from the ESP hardware RNG
-		 * This is necessary because we don't support any of the BearSSL methods
-		 */
 		for (int i = 0; i < 10; i++) {
 			int rand = hwrand();
 			br_ssl_engine_inject_entropy(&sc.eng, &rand, 4);
 		}
 
-		/*
-		 * Reset the client context, for a new handshake. We provide the
-		 * target host name: it will be used for the SNI extension. The
-		 * last parameter is 0: we are not trying to resume a session.
-		 */
 		br_ssl_client_reset(&sc, WEB_SERVER, 0);
 
-		/*
-		 * Initialise the simplified I/O wrapper context, to use our
-		 * SSL client context, and the two callbacks for socket I/O.
-		 */
 		br_sslio_init(&ioc, &sc.eng, sock_read, &fd, sock_write, &fd);
 		printf("done.\r\n");
 
-		/* FIXME: set date & time using epoch time precompiler flag for now */
-		provisional_time = CONFIG_EPOCH_TIME + (xTaskGetTickCount()/configTICK_RATE_HZ);
-		xc.days = (provisional_time / CLOCK_SECONDS_PER_DAY) + 719528;
-		xc.seconds = provisional_time % CLOCK_SECONDS_PER_DAY;
-		printf("Time: %02i:%02i\r\n",
-				(int)(xc.seconds / CLOCK_SECONDS_PER_HOUR),
-				(int)((xc.seconds % CLOCK_SECONDS_PER_HOUR)/CLOCK_SECONDS_PER_MINUTE)
-				);
-
+		 //FIXME: set date & time using epoch time precompiler flag for now 
+			 provisional_time = CONFIG_EPOCH_TIME + (xTaskGetTickCount()/configTICK_RATE_HZ);
+			 xc.days = (provisional_time / CLOCK_SECONDS_PER_DAY) + 719528;
+			 xc.seconds = provisional_time % CLOCK_SECONDS_PER_DAY;
+			 printf("Time: %02i:%02i\r\n",
+			 (int)(xc.seconds / CLOCK_SECONDS_PER_HOUR),
+			 (int)((xc.seconds % CLOCK_SECONDS_PER_HOUR)/CLOCK_SECONDS_PER_MINUTE)
+			 );
+		
 		if (connect(fd, res->ai_addr, res->ai_addrlen) != 0)
 		{
 			close(fd);
@@ -248,24 +228,15 @@ void http_post_task(void *pvParameters) {
 		}
 		printf("Connected\r\n");
 
-		/*
-		 * Note that while the context has, at that point, already
-		 * assembled the ClientHello to send, nothing happened on the
-		 * network yet. Real I/O will occur only with the next call.
-		 *
-		 * We write our simple HTTP request. We test the call
-		 * for an error (-1), but this is not strictly necessary, since
-		 * the error state "sticks": if the context fails for any reason
-		 * (e.g. bad server certificate), then it will remain in failed
-		 * state and all subsequent calls will return -1 as well.
-		 */
 		request[0] = "\0";
 		content[0] = "\0";
 
-		snprintf(content, 80, "{\"sensors\":{\"brightness\":%d,\"lux_back\":%.1f,\"lux_front\":%.1f}}", 98, 10.1, 12.2);
+		snprintf(content, 80, "{\"sensors\":{\"brightness\":%d,\"lux_back\":%.1f,\"lux_front\":%.1f}}", led_brightness, lux_back, lux_front);
 
-		snprintf(request, 300, "PUT /%d/data.json HTTP/1.1\r\nHost: "WEB_SERVER"\r\nUser-Agent: ESP8266\r\nAccept: */*\r\nContent-Length: %d\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n%s", count++, strlen(content), content);
+		snprintf(request, 300, "PUT /data.json HTTP/1.1\r\nHost: "WEB_SERVER"\r\nUser-Agent: ESP8266\r\nContent-Length: %d\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n%s", strlen(content), content);
 		printf(request);
+
+		printf("\nSEND REQUEST\n");
 		if (br_sslio_write_all(&ioc, request, strlen(request)) != BR_ERR_OK) {
 			close(fd);
 			freeaddrinfo(res);
@@ -273,16 +244,11 @@ void http_post_task(void *pvParameters) {
 			failures++;
 			continue;
 		}
+		printf("\nREQUEST SENT\n");
 
-		/*
-		 * SSL is a buffered protocol: we make sure that all our request
-		 * bytes are sent onto the wire.
-		 */
 		br_sslio_flush(&ioc);
+		printf("\nFLUSH DONE\n");
 
-		/*
-		 * Read and print the server response
-		 */
 		for (;;)
 		{
 			int rlen;
@@ -299,10 +265,8 @@ void http_post_task(void *pvParameters) {
 				printf("%s", buf);
 			}
 		}
+		printf("\nRESPONSE DONE\n");
 
-		/*
-		 * If reading the response failed for any reason, we detect it here
-		 */
 		if (br_ssl_engine_last_error(&sc.eng) != BR_ERR_OK) {
 			close(fd);
 			freeaddrinfo(res);
@@ -313,9 +277,6 @@ void http_post_task(void *pvParameters) {
 
 		printf("\r\n\r\nfree heap pre  = %u\r\n", xPortGetFreeHeapSize());
 
-		/*
-		 * Close the connection and start over after a delay
-		 */
 		close(fd);
 		freeaddrinfo(res);
 
@@ -327,9 +288,10 @@ void http_post_task(void *pvParameters) {
 			printf("%d...\n", countdown);
 			vTaskDelay(1000 / portTICK_PERIOD_MS);
 		}
-		printf("Starting again!\r\n\r\n");
+		break;
 	}
 }
+
 
 /* ---------- LIGHT SENSOR HANDLER ---------- */
 /* ------------------------------------------ */
@@ -350,22 +312,50 @@ void read_lux() {
 
 /* ---------- OLED HANDLER ------------------ */
 /* ------------------------------------------ */
-const int led_gpio = 2;     
-bool led_on = false;        //oled status
-float led_brightness = 100; //brightness is scaled from 0 to 100 
+bool bright_request = false;
 
 void led_write(bool on) {
+	if (!bright_request) {
+		if (!on) pwm_set_duty(0);
+		else {
+			if (led_brightness != 0) led_set();
+			else {
+				led_brightness = 100;
+				led_set();
+			}
+		}
+	}	
+	else bright_request = false;
+  //gpio_write(led_gpio, on ? 0 : 1);
+}
+
+void potar_task() {
+	uint16_t adc_read = 0;
+	while (1) {
+		adc_read = sdk_system_adc_read();
+		printf("POTAR: %d\n", adc_read);
+		vTaskDelay(500 / portTICK_PERIOD_MS);	
+	}
+}
+
+void led_write_with_data(bool on) {
   gpio_write(led_gpio, on ? 0 : 1);
+  //xTaskCreate(&http_task_helper, "PostTask", 2048, NULL, 2, NULL);
 }
 
 void led_set() {
-  gpio_write(led_gpio, led_brightness);
+	if (led_brightness >= 0 && led_brightness <= 100) 
+		pwm_set_duty(led_brightness*UINT16_MAX/100);	
 }
 
 void led_init() {
   printf("Initializing OLED panel...\n");
   gpio_enable(led_gpio, GPIO_OUTPUT);
-  led_write(led_on);
+	pwm_init(1, pwm_pin, true);
+	pwm_set_freq(1000);
+	pwm_set_duty(UINT16_MAX/2);
+	pwm_start();
+  //led_write(led_on);
 }
 
 void led_identify_task(void *_args) {
@@ -405,9 +395,9 @@ void led_on_set(homekit_value_t value) {
     printf("Invalid value format: %d\n", value.format);
     return;
   }
-
+printf("LED ON SET\n");
   led_on = value.bool_value;
-  led_write(led_on);
+	led_write(led_on);
 }
 
 void led_brightness_set(homekit_value_t value) {
@@ -415,7 +405,9 @@ void led_brightness_set(homekit_value_t value) {
     printf("Invalid brightness-value format: %d\n", value.format);
     return;
   }
+printf("LED BRIGHT SET\n");
   led_brightness = value.int_value;
+	bright_request = true;
   led_set();
 }
 
@@ -433,7 +425,7 @@ homekit_accessory_t *accessories[] = {
       HOMEKIT_SERVICE(LIGHTBULB, .primary=true, .characteristics=(homekit_characteristic_t*[]){
           HOMEKIT_CHARACTERISTIC(NAME, "OLED"),
           HOMEKIT_CHARACTERISTIC(
-              ON, false,
+              ON, true,
               .getter=led_on_get,
               .setter=led_on_set
               ),
@@ -479,10 +471,10 @@ void user_init(void) {
   uart_set_baud(0, 115200);
 
   led_init();
-  //wifi_init(); //use if wifi credentials are provided in "wifi.h"
-  wifi_config(); //use if no credentials provided
+  wifi_init(); //use if wifi credentials are provided in "wifi.h"
+  //wifi_config(); //use if no credentials provided
   homekit_init();
-  xTaskCreate(&http_post_task, "PostTask", 2048, NULL, 2, NULL);
+	//xTaskCreate(potar_task, "Potar", 500, NULL, 2, NULL);
   //tsl_init();
   //read_lux();
 }

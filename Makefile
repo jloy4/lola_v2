@@ -7,6 +7,7 @@ EXTRA_COMPONENTS = \
 	extras/wificfg \
 	extras/dhcpserver \
 	extras/bearssl \
+	extras/pwm \
 	$(abspath ../../components/wolfssl) \
 	$(abspath ../../components/cJSON) \
 	$(abspath ../../components/homekit) \
