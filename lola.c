@@ -28,11 +28,16 @@
 
 #include "bearssl.h"
 
-const int led_gpio = 2;     
 const int potar_gpio = 5;
 uint8_t pwm_pin[1] = {2};
-bool led_on = false;        //oled status
+bool led_on = false;      //oled status
 int led_brightness = 100; //brightness is scaled from 0 to 100 
+
+bool bright_request = false;
+bool new_post_request = false;
+BaseType_t xPostReturned;
+TaskHandle_t xPostHandle = NULL;
+
 
 double lux_back = 0;
 double lux_front = 0;
@@ -168,88 +173,95 @@ static br_ssl_client_context sc;
 static br_x509_minimal_context xc;
 static br_sslio_context ioc;
 
-void http_task_helper(void *pvParameters) {
-	int successes = 0, failures = 0;
+void post_task(void *pvParameters) {
+printf("POSTING DATA\n");
+
+	//wait 40*500=20,000ms to make sure no other post request has been sent
+	/*new_post_request = false;
+	for (int i=0; i<40; i++) {
+		if (new_post_request) vTaskDelete(NULL);
+		vTaskDelay(200 / portTICK_PERIOD_MS);
+		printf("%d ", i);
+	}
+	new_post_request = true;*/
+
+	//int successes = 0, failures = 0;
 	int provisional_time = 0;
 
-	while (1) {
-		const struct addrinfo hints = {
-			.ai_family = AF_INET,
-			.ai_socktype = SOCK_STREAM,
-		};
-		struct addrinfo *res = NULL;
-		int dns_err = 0;
-		do {
-			if (res)
-				freeaddrinfo(res);
-			vTaskDelay(1000 / portTICK_PERIOD_MS);
-			dns_err = getaddrinfo(WEB_SERVER, WEB_PORT, &hints, &res);
-		} while(dns_err != 0 || res == NULL);
-
-		int fd = socket(res->ai_family, res->ai_socktype, 0);
-		if (fd < 0) {
+	const struct addrinfo hints = {
+		.ai_family = AF_INET,
+		.ai_socktype = SOCK_STREAM,
+	};
+	struct addrinfo *res = NULL;
+	int dns_err = 0;
+	do {
+		if (res)
 			freeaddrinfo(res);
-			printf("socket failed\n");
-			failures++;
-			continue;
-		}
+		vTaskDelay(1000 / portTICK_PERIOD_MS);
+		dns_err = getaddrinfo(WEB_SERVER, WEB_PORT, &hints, &res);
+	} while(dns_err != 0 || res == NULL);
 
-		printf("Initializing BearSSL... ");
-		br_ssl_client_init_full(&sc, &xc, TAs, TAs_NUM);
+	int fd = socket(res->ai_family, res->ai_socktype, 0);
+	if (fd < 0) {
+		freeaddrinfo(res);
+		printf("socket failed\n");
+		//failures++;
+		return;
+	}
 
-		br_ssl_engine_set_buffer(&sc.eng, bearssl_buffer, sizeof bearssl_buffer, 0);
+	printf("Initializing BearSSL... ");
+	br_ssl_client_init_full(&sc, &xc, TAs, TAs_NUM);
 
-		for (int i = 0; i < 10; i++) {
-			int rand = hwrand();
-			br_ssl_engine_inject_entropy(&sc.eng, &rand, 4);
-		}
+	br_ssl_engine_set_buffer(&sc.eng, bearssl_buffer, sizeof bearssl_buffer, 0);
 
-		br_ssl_client_reset(&sc, WEB_SERVER, 0);
+	for (int i = 0; i < 10; i++) {
+		int rand = hwrand();
+		br_ssl_engine_inject_entropy(&sc.eng, &rand, 4);
+	}
 
-		br_sslio_init(&ioc, &sc.eng, sock_read, &fd, sock_write, &fd);
-		printf("done.\r\n");
+	br_ssl_client_reset(&sc, WEB_SERVER, 0);
 
-		 //FIXME: set date & time using epoch time precompiler flag for now 
-			 provisional_time = CONFIG_EPOCH_TIME + (xTaskGetTickCount()/configTICK_RATE_HZ);
-			 xc.days = (provisional_time / CLOCK_SECONDS_PER_DAY) + 719528;
-			 xc.seconds = provisional_time % CLOCK_SECONDS_PER_DAY;
-			 printf("Time: %02i:%02i\r\n",
-			 (int)(xc.seconds / CLOCK_SECONDS_PER_HOUR),
-			 (int)((xc.seconds % CLOCK_SECONDS_PER_HOUR)/CLOCK_SECONDS_PER_MINUTE)
-			 );
-		
-		if (connect(fd, res->ai_addr, res->ai_addrlen) != 0)
-		{
-			close(fd);
-			freeaddrinfo(res);
-			printf("connect failed\n");
-			failures++;
-			continue;
-		}
-		printf("Connected\r\n");
+	br_sslio_init(&ioc, &sc.eng, sock_read, &fd, sock_write, &fd);
+	printf("done.\r\n");
 
-		request[0] = "\0";
-		content[0] = "\0";
+	//FIXME: set date & time using epoch time precompiler flag for now 
+	provisional_time = CONFIG_EPOCH_TIME + (xTaskGetTickCount()/configTICK_RATE_HZ);
+	xc.days = (provisional_time / CLOCK_SECONDS_PER_DAY) + 719528;
+	xc.seconds = provisional_time % CLOCK_SECONDS_PER_DAY;
+	printf("Time: %02i:%02i\r\n",
+			(int)(xc.seconds / CLOCK_SECONDS_PER_HOUR),
+			(int)((xc.seconds % CLOCK_SECONDS_PER_HOUR)/CLOCK_SECONDS_PER_MINUTE)
+			);
 
-		snprintf(content, 80, "{\"sensors\":{\"brightness\":%d,\"lux_back\":%.1f,\"lux_front\":%.1f}}", led_brightness, lux_back, lux_front);
+	if (connect(fd, res->ai_addr, res->ai_addrlen) != 0)
+	{
+		close(fd);
+		freeaddrinfo(res);
+		printf("connect failed\n");
+		//failures++;
+		return;
+	}
+	printf("Connected\r\n");
 
-		snprintf(request, 300, "PUT /data.json HTTP/1.1\r\nHost: "WEB_SERVER"\r\nUser-Agent: ESP8266\r\nContent-Length: %d\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n%s", strlen(content), content);
+	request[0] = "\0";
+	content[0] = "\0";
+
+	snprintf(content, 80, "{\"sensors\":{\"brightness\":%d,\"lux_back\":%.1f,\"lux_front\":%.1f}}", led_brightness, lux_back, lux_front);
+
+	snprintf(request, 300, "POST /data.json HTTP/1.1\r\nHost: "WEB_SERVER"\r\nUser-Agent: ESP8266\r\nContent-Length: %d\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n%s", strlen(content), content);
 		printf(request);
 
-		printf("\nSEND REQUEST\n");
 		if (br_sslio_write_all(&ioc, request, strlen(request)) != BR_ERR_OK) {
 			close(fd);
 			freeaddrinfo(res);
 			printf("br_sslio_write_all failed: %d\r\n", br_ssl_engine_last_error(&sc.eng));
-			failures++;
-			continue;
+			//failures++;
+			return;
 		}
-		printf("\nREQUEST SENT\n");
 
 		br_sslio_flush(&ioc);
-		printf("\nFLUSH DONE\n");
 
-		for (;;)
+		/*for (;;)
 		{
 			int rlen;
 			unsigned char buf[128];
@@ -257,6 +269,7 @@ void http_task_helper(void *pvParameters) {
 			bzero(buf, 128);
 			// Leave the final byte for zero termination
 			rlen = br_sslio_read(&ioc, buf, sizeof(buf) - 1);
+printf("\nrlen: %d\n", rlen);
 
 			if (rlen < 0) {
 				break;
@@ -264,15 +277,14 @@ void http_task_helper(void *pvParameters) {
 			if (rlen > 0) {
 				printf("%s", buf);
 			}
-		}
-		printf("\nRESPONSE DONE\n");
+		}*/
 
 		if (br_ssl_engine_last_error(&sc.eng) != BR_ERR_OK) {
 			close(fd);
 			freeaddrinfo(res);
 			printf("failure, error = %d\r\n", br_ssl_engine_last_error(&sc.eng));
-			failures++;
-			continue;
+			//failures++;
+			return;
 		}
 
 		printf("\r\n\r\nfree heap pre  = %u\r\n", xPortGetFreeHeapSize());
@@ -282,14 +294,11 @@ void http_task_helper(void *pvParameters) {
 
 		printf("free heap post = %u\r\n", xPortGetFreeHeapSize());
 
-		successes++;
-		printf("successes = %d failures = %d\r\n", successes, failures);
-		for(int countdown = 10; countdown >= 0; countdown--) {
-			printf("%d...\n", countdown);
-			vTaskDelay(1000 / portTICK_PERIOD_MS);
-		}
-		break;
-	}
+		//successes++;
+		printf("data posted");
+		
+		new_post_request = false;
+		vTaskDelete(NULL);
 }
 
 
@@ -298,9 +307,13 @@ void http_task_helper(void *pvParameters) {
 tsl2561_t *device;
 
 void tsl_init() {
-  tsl2561_init(device);
-  tsl2561_set_integration_time(device, TSL2561_INTEGRATION_13MS);
-  tsl2561_set_gain(device, TSL2561_GAIN_1X);
+	printf("Initializing light sensors...");
+  tsl2561_init(&device);
+	printf("init done...");
+  tsl2561_set_integration_time(&device, TSL2561_INTEGRATION_13MS);
+  tsl2561_set_gain(&device, TSL2561_GAIN_1X);
+	printf("Done\n");
+	vTaskDelete(NULL);
 }
 
 void read_lux() {
@@ -312,65 +325,82 @@ void read_lux() {
 
 /* ---------- OLED HANDLER ------------------ */
 /* ------------------------------------------ */
-bool bright_request = false;
-
-void led_write(bool on) {
-	if (!bright_request) {
-		if (!on) pwm_set_duty(0);
-		else {
-			if (led_brightness != 0) led_set();
-			else {
-				led_brightness = 100;
-				led_set();
-			}
-		}
-	}	
-	else bright_request = false;
-  //gpio_write(led_gpio, on ? 0 : 1);
-}
-
-void potar_task() {
-	uint16_t adc_read = 0;
-	while (1) {
-		adc_read = sdk_system_adc_read();
-		printf("POTAR: %d\n", adc_read);
-		vTaskDelay(500 / portTICK_PERIOD_MS);	
-	}
-}
-
-void led_write_with_data(bool on) {
-  gpio_write(led_gpio, on ? 0 : 1);
-  //xTaskCreate(&http_task_helper, "PostTask", 2048, NULL, 2, NULL);
-}
+#define MIN_POTAR 21
+#define MAX_POTAR 1024
+#define NOISE     10
 
 void led_set() {
 	if (led_brightness >= 0 && led_brightness <= 100) 
 		pwm_set_duty(led_brightness*UINT16_MAX/100);	
 }
 
+void led_write(bool on, bool post) {
+	printf("bright_request: %d, post: %d, new_post: %d\n", bright_request, post, new_post_request);
+	if (!bright_request) {
+		if (!on) {
+			led_brightness = 0;
+			led_set();
+		} else {
+			if (led_brightness != 0) led_set();
+			else {
+				led_brightness = 100;
+				led_set();
+			}
+		}
+		if (post && !new_post_request) {
+			xPostReturned = xTaskCreate(post_task, "PostTask", 2048, NULL, 2, NULL);
+			if (xPostReturned == pdPASS) new_post_request = true; //handles the case where the task is not created
+			//post_task(NULL);
+		}
+	}	
+	else bright_request = false;
+}
+
+uint16_t read_0 = MAX_POTAR;
+uint16_t read_1 = MAX_POTAR;
+void potar_task() {
+	while (1) {
+		read_1 = sdk_system_adc_read();
+		//printf("POTAR: %d\n", read_1);
+		if (read_1 > read_0 + NOISE || read_1 < read_0 - NOISE) {
+			if (read_1 < MIN_POTAR) {
+				led_on = false;
+				led_brightness = 0;
+			}
+			else {
+				led_on = true;
+				led_brightness = read_1*100/(MAX_POTAR-MIN_POTAR);
+			}
+			led_set();
+			read_0 = read_1;
+		}
+		vTaskDelay(100 / portTICK_PERIOD_MS);	
+	}
+}
+
 void led_init() {
-  printf("Initializing OLED panel...\n");
-  gpio_enable(led_gpio, GPIO_OUTPUT);
+  printf("Initializing OLED panel...");
 	pwm_init(1, pwm_pin, true);
 	pwm_set_freq(1000);
 	pwm_set_duty(UINT16_MAX/2);
 	pwm_start();
+	printf("Done\n");
   //led_write(led_on);
 }
 
 void led_identify_task(void *_args) {
   for (int i=0; i<3; i++) {
     for (int j=0; j<2; j++) {
-      led_write(true);
+      led_write(true, false);
       vTaskDelay(100 / portTICK_PERIOD_MS);
-      led_write(false);
+      led_write(false, false);
       vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 
     vTaskDelay(250 / portTICK_PERIOD_MS);
   }
 
-  led_write(led_on);
+  led_write(led_on, false);
 
   vTaskDelete(NULL);
 }
@@ -395,9 +425,9 @@ void led_on_set(homekit_value_t value) {
     printf("Invalid value format: %d\n", value.format);
     return;
   }
-printf("LED ON SET\n");
+
   led_on = value.bool_value;
-	led_write(led_on);
+	led_write(led_on, true);
 }
 
 void led_brightness_set(homekit_value_t value) {
@@ -405,7 +435,7 @@ void led_brightness_set(homekit_value_t value) {
     printf("Invalid brightness-value format: %d\n", value.format);
     return;
   }
-printf("LED BRIGHT SET\n");
+
   led_brightness = value.int_value;
 	bright_request = true;
   led_set();
@@ -425,7 +455,7 @@ homekit_accessory_t *accessories[] = {
       HOMEKIT_SERVICE(LIGHTBULB, .primary=true, .characteristics=(homekit_characteristic_t*[]){
           HOMEKIT_CHARACTERISTIC(NAME, "OLED"),
           HOMEKIT_CHARACTERISTIC(
-              ON, true,
+              ON, false,
               .getter=led_on_get,
               .setter=led_on_set
               ),
@@ -453,7 +483,7 @@ void get_wifi_status() {
   while (sdk_wifi_station_get_connect_status() != STATION_GOT_IP) {
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
-  led_write(1);
+	//led_write(true, false);
   wificfg_got_sta_connect();
   homekit_server_init(&config); //start homekit only if wifi available
   if (xReturned == pdPASS) vTaskDelete(xHandle); //stop checking wifi status
@@ -475,6 +505,6 @@ void user_init(void) {
   //wifi_config(); //use if no credentials provided
   homekit_init();
 	//xTaskCreate(potar_task, "Potar", 500, NULL, 2, NULL);
-  //tsl_init();
+  //xTaskCreate(tsl_init, "TSLInit", 512, NULL, 2, NULL);
   //read_lux();
 }
