@@ -329,27 +329,26 @@ void read_lux() {
 #define MAX_POTAR 1024
 #define NOISE     10
 
-void led_set() {
-	if (led_brightness >= 0 && led_brightness <= 100) 
-		pwm_set_duty(led_brightness*UINT16_MAX/100);	
+void led_set(int b) {
+	if (b >= 0 && b <= 100) 
+		pwm_set_duty(b*UINT16_MAX/100);	
 }
 
 void led_write(bool on, bool post) {
 	printf("bright_request: %d, post: %d, new_post: %d\n", bright_request, post, new_post_request);
 	if (!bright_request) {
 		if (!on) {
-			led_brightness = 0;
-			led_set();
+			led_set(0);
 		} else {
-			if (led_brightness != 0) led_set();
+			if (led_brightness != 0) led_set(led_brightness);
 			else {
 				led_brightness = 100;
-				led_set();
+				led_set(led_brightness);
 			}
 		}
 		if (post && !new_post_request) {
-			xPostReturned = xTaskCreate(post_task, "PostTask", 2048, NULL, 2, NULL);
-			if (xPostReturned == pdPASS) new_post_request = true; //handles the case where the task is not created
+			//xPostReturned = xTaskCreate(post_task, "PostTask", 2048, NULL, 2, NULL);
+			//if (xPostReturned == pdPASS) new_post_request = true; //handles the case where the task is not created
 			//post_task(NULL);
 		}
 	}	
@@ -371,7 +370,7 @@ void potar_task() {
 				led_on = true;
 				led_brightness = read_1*100/(MAX_POTAR-MIN_POTAR);
 			}
-			led_set();
+			led_set(led_brightness);
 			read_0 = read_1;
 		}
 		vTaskDelay(100 / portTICK_PERIOD_MS);	
@@ -438,7 +437,7 @@ void led_brightness_set(homekit_value_t value) {
 
   led_brightness = value.int_value;
 	bright_request = true;
-  led_set();
+  led_set(led_brightness);
 }
 
 homekit_accessory_t *accessories[] = {
@@ -476,22 +475,16 @@ homekit_server_config_t config = {
   .password = "111-11-111"
 };
 
-BaseType_t xReturned;
-TaskHandle_t xHandle = NULL;
-
-void get_wifi_status() {
+void homekit_init_task() {
   while (sdk_wifi_station_get_connect_status() != STATION_GOT_IP) {
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 	//led_write(true, false);
   wificfg_got_sta_connect();
   homekit_server_init(&config); //start homekit only if wifi available
-  if (xReturned == pdPASS) vTaskDelete(xHandle); //stop checking wifi status
+  vTaskDelete(NULL); //stop checking wifi status
 }
 
-void homekit_init() {
-  xReturned = xTaskCreate(get_wifi_status, "WifiStatus", 500, NULL, 2, &xHandle);
-}
 
 /* ---------- MAIN ---------- */
 /* --------------------------------- */
@@ -503,7 +496,7 @@ void user_init(void) {
   led_init();
   wifi_init(); //use if wifi credentials are provided in "wifi.h"
   //wifi_config(); //use if no credentials provided
-  homekit_init();
+  xTaskCreate(homekit_init_task, "Homekit Init", 512, NULL, 2, NULL);
 	//xTaskCreate(potar_task, "Potar", 500, NULL, 2, NULL);
   //xTaskCreate(tsl_init, "TSLInit", 512, NULL, 2, NULL);
   //read_lux();

@@ -1,2 +1,2 @@
-#define WIFI_SSID "WeWork"
-#define WIFI_PASSWORD "P@ssw0rd"
+#define WIFI_SSID "Snowcrest"
+#define WIFI_PASSWORD ""
